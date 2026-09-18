@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -701,6 +702,77 @@ func TestClusterBoardServesSnapshot(t *testing.T) {
 	}
 }
 
+func TestHistoricalRangeValidation(t *testing.T) {
+	validStart := "2026-09-16T00:00:00Z"
+	validEnd := "2026-09-17T09:00:00Z"
+	tests := []struct {
+		name      string
+		query     string
+		wantError string
+		want      time.Duration
+	}{
+		{name: "duration", query: "window=24h", want: 24 * time.Hour},
+		{name: "custom", query: "start=" + url.QueryEscape(validStart) + "&end=" + url.QueryEscape(validEnd), want: 33 * time.Hour},
+		{name: "malformed duration", query: "window=tomorrow", wantError: "window must be"},
+		{name: "zero duration", query: "window=0s", wantError: "window must be"},
+		{name: "duration too long", query: "window=721h", wantError: "window must be"},
+		{name: "missing end", query: "start=" + url.QueryEscape(validStart), wantError: "requires both"},
+		{name: "mixed", query: "window=1h&start=" + url.QueryEscape(validStart) + "&end=" + url.QueryEscape(validEnd), wantError: "either window or start/end"},
+		{name: "malformed start", query: "start=bad&end=" + url.QueryEscape(validEnd), wantError: "start must be"},
+		{name: "reverse custom", query: "start=" + url.QueryEscape(validEnd) + "&end=" + url.QueryEscape(validStart), wantError: "end must be after start"},
+		{name: "custom too long", query: "start=2026-08-01T00%3A00%3A00Z&end=" + url.QueryEscape(validEnd), wantError: "must not exceed"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			values, err := url.ParseQuery(tc.query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			window, start, end, err := parseHistoricalRange(values)
+			if tc.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+					t.Fatalf("error = %v, want containing %q", err, tc.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseHistoricalRange: %v", err)
+			}
+			if window != tc.want {
+				t.Fatalf("window = %s, want %s", window, tc.want)
+			}
+			if tc.name == "custom" && (start.Format(time.RFC3339) != validStart || end.Format(time.RFC3339) != validEnd) {
+				t.Fatalf("bounds = %s to %s, want %s to %s", start, end, validStart, validEnd)
+			}
+		})
+	}
+}
+
+func TestHistoricalHandlersRejectInvalidRanges(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		opts Options
+	}{
+		{name: "cluster", path: "/api/portal/cluster?window=bad", opts: Options{Stellar: expapi.Options{Source: "kusto"}, Cluster: ClusterOptions{Querier: &stubClusterQuerier{}}}},
+		{name: "cost", path: "/api/portal/cost?start=bad&end=2026-09-17T09%3A00%3A00Z", opts: Options{Stellar: expapi.Options{Source: "kusto"}, Cost: CostOptions{Querier: &stubCostQuerier{}}}},
+		{name: "node util", path: "/api/portal/nodeutil?window=1h&start=2026-09-16T00%3A00%3A00Z&end=2026-09-17T09%3A00%3A00Z", opts: Options{Stellar: expapi.Options{Source: "kusto"}, NodeUtil: NodeUtilOptions{Querier: &stubClusterQuerier{}}}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server, err := NewServer(tc.opts)
+			if err != nil {
+				t.Fatalf("NewServer: %v", err)
+			}
+			rec := httptest.NewRecorder()
+			server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
 func TestClusterBoardUnavailableWithoutQuerier(t *testing.T) {
 	// newTestServer builds a server with no Cluster.Querier → board disabled.
 	rec := httptest.NewRecorder()
@@ -897,7 +969,7 @@ func TestRayBoardServesSnapshot(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/portal/ray?namespace=ray", nil))
+	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/portal/ray?namespace=ray&window=24h", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
@@ -946,14 +1018,14 @@ func TestRayBoardServesScopedDurableHistory(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/portal/ray?namespace=ray", nil))
+	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/portal/ray?namespace=ray&window=24h", nil))
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"historyState":"available"`) ||
 		!strings.Contains(rec.Body.String(), "completed-ray") || strings.Contains(rec.Body.String(), "other-namespace") ||
 		strings.Contains(rec.Body.String(), "other-cluster") || strings.Contains(rec.Body.String(), "other-kind") {
 		t.Fatalf("ray response = %d %s", rec.Code, rec.Body.String())
 	}
 	if history.calls != 1 || history.scope.Cluster != "cluster-a" || history.scope.Namespace != "ray" || history.scope.WorkspaceID != "default" ||
-		history.scope.Table != "TauExpRunLifecycle" || history.scope.Limit != 25 {
+		history.scope.Table != "TauExpRunLifecycle" || history.scope.Limit != 25 || history.scope.Window != "24h0m0s" {
 		t.Fatalf("history scope = %+v (calls=%d)", history.scope, history.calls)
 	}
 
@@ -980,15 +1052,52 @@ func TestRayHistoryPinsSingleWorkspaceDurableScope(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/portal/ray/history/uid-1?workspace=other-workspace&namespace=other-namespace&cluster=other-cluster", nil))
+	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/portal/ray/history/uid-1?workspace=other-workspace&namespace=other-namespace&cluster=other-cluster&start=2026-09-16T00%3A00%3A00Z&end=2026-09-17T09%3A00%3A00Z", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 	if history.timelineCalls != 1 || history.resourceUID != "uid-1" ||
 		history.timelineScope.Cluster != "cluster-a" || history.timelineScope.Namespace != "ray" || history.timelineScope.WorkspaceID != "taugrid-default" ||
-		history.timelineScope.Table != "TauExpRunLifecycle" || history.timelineScope.Kind != "RayJob" || history.timelineScope.Limit != 25 {
+		history.timelineScope.Table != "TauExpRunLifecycle" || history.timelineScope.Kind != "RayJob" || history.timelineScope.Limit != 25 ||
+		history.timelineScope.Start.IsZero() || history.timelineScope.End.IsZero() {
 		t.Fatalf("timeline scope = %+v, resourceUID=%q, calls=%d", history.timelineScope, history.resourceUID, history.timelineCalls)
 	}
+
+	t.Run("invalid ranges stop before history reads", func(t *testing.T) {
+		tests := []struct {
+			name string
+			path string
+			ray  bool
+		}{
+			{name: "runs", path: "/api/portal/runs?window=bad"},
+			{name: "ray", path: "/api/portal/ray?start=bad&end=2026-09-17T09%3A00%3A00Z", ray: true},
+			{name: "ray timeline", path: "/api/portal/ray/history/uid-1?window=0s"},
+		}
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				history := &scopedHistoryReader{timeline: []runs.LifecycleEvent{{
+					ResourceUID: "uid-1", Namespace: "ray", Cluster: "cluster-a", Kind: "RayJob",
+				}}}
+				opts := Options{
+					Stellar: expapi.Options{Source: "kusto"},
+					Cluster: ClusterOptions{Cluster: "cluster-a"},
+					Runs:    RunsOptions{Reader: &stubRunsReader{}, Namespace: "ray", History: history},
+				}
+				if test.ray {
+					opts.Ray = RayOptions{Reader: &stubRayReader{}, Namespace: "ray"}
+				}
+				server, err := NewServer(opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				rec := httptest.NewRecorder()
+				server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, test.path, nil))
+				if rec.Code != http.StatusBadRequest || history.calls != 0 || history.timelineCalls != 0 {
+					t.Fatalf("status=%d listCalls=%d timelineCalls=%d body=%s", rec.Code, history.calls, history.timelineCalls, rec.Body.String())
+				}
+			})
+		}
+	})
 }
 
 func TestRayHistoryAllowsSingleWorkspaceClusterWideDurableScope(t *testing.T) {
