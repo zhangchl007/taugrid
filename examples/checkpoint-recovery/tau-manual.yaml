@@ -1,0 +1,31 @@
+name: recovery-manual
+engine: job
+entrypoint: train.py
+runtime:
+  # MCR acpt-pytorch-2.8-cuda12.6:17; Linux amd64, Python 3.10.
+  # Verify python3/torch at gated preflight; no runtime.pip for direct Jobs.
+  image: mcr.microsoft.com/azureml/curated/acpt-pytorch-2.8-cuda12.6@sha256:91e8a139c823b16db0bd0bf790fdef80179c4d9e8d05e227b09ab06c1a5f1e69
+  env:
+    RECOVERY_DEVICE: cuda
+    RECOVERY_CHECKPOINT_DIR: /data/checkpoints/finetunes/recovery-manual
+    RECOVERY_STEPS: "400"
+    RECOVERY_STEP_DELAY: "0.25"
+    CUBLAS_WORKSPACE_CONFIG: ":4096:8"
+compute:
+  gpus: 1
+  cpu_request: "1"
+  cpu_limit: "2"
+  memory_request: 2Gi
+  memory_limit: 4Gi
+storage:
+  data_pvc: recovery-checkpoints
+  output: /data/checkpoints/finetunes/recovery-manual
+policy:
+  namespace: taugrid-default
+  queue: jobqueue
+resilience:
+  max_retries: 0
+  retry_on: [Preempted, Evicted]
+  backoff_initial: 5s
+  backoff_max: 10s
+  checkpoint_path: /data/checkpoints/finetunes/recovery-manual
