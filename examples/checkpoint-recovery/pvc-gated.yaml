@@ -1,0 +1,15 @@
+# PROPOSAL ONLY. Applying provisions billable Azure storage; owner approval required.
+# 1Gi requested does not mean 1Gi billed: Azure managed disk minimum tier applies.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: recovery-checkpoints
+  namespace: taugrid-default
+  labels:
+    app.kubernetes.io/part-of: checkpoint-recovery-acceptance
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: default
+  resources:
+    requests:
+      storage: 1Gi
